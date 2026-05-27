@@ -1,26 +1,29 @@
 // Aven Voice — main app logic
 // Pipeline: MediaRecorder → Whisper STT → OpenClaw API → OpenAI TTS → Audio playback
 // Parallel: Discord channel logging
+//
+// UX: Tap-to-Toggle — one tap starts recording, next tap stops + sends
+// API: all OpenClaw calls go through /api/chat proxy on server.js (no CORS)
 
 "use strict";
 
 // ─── State ───────────────────────────────────────────────────────────────────
-let mediaRecorder = null;
-let audioChunks = [];
-let isRecording = false;
-let isBusy = false;
-let currentAudio = null;
+let mediaRecorder    = null;
+let audioChunks      = [];
+let isRecording      = false;
+let isBusy           = false;
+let currentAudio     = null;
 let recordingTimeout = null;
 
 // ─── DOM ──────────────────────────────────────────────────────────────────────
-const micBtn = document.getElementById("mic-btn");
-const statusEl = document.getElementById("status");
+const micBtn      = document.getElementById("mic-btn");
+const statusEl    = document.getElementById("status");
 const transcriptEl = document.getElementById("transcript");
 
 // ─── Status helpers ───────────────────────────────────────────────────────────
 function setStatus(text, cls = "idle") {
   statusEl.textContent = text;
-  statusEl.className = `status ${cls}`;
+  statusEl.className   = `status ${cls}`;
 }
 
 // ─── Transcript / Bubbles ─────────────────────────────────────────────────────
@@ -44,8 +47,6 @@ function addBubble(role, text) {
 
 // ─── Microphone / Recording ───────────────────────────────────────────────────
 async function startRecording() {
-  if (isBusy) return;
-
   let stream;
   try {
     stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -59,7 +60,7 @@ async function startRecording() {
   const mimeType = ["audio/webm;codecs=opus", "audio/webm", "audio/ogg", "audio/mp4"]
     .find(t => MediaRecorder.isTypeSupported(t)) || "";
 
-  audioChunks = [];
+  audioChunks   = [];
   mediaRecorder = new MediaRecorder(stream, mimeType ? { mimeType } : {});
 
   mediaRecorder.addEventListener("dataavailable", e => {
@@ -74,11 +75,11 @@ async function startRecording() {
 
   mediaRecorder.start(100); // collect in 100ms chunks
   isRecording = true;
-  isBusy = true;
+  isBusy      = true;
   micBtn.classList.add("recording");
-  setStatus("Aufnahme...", "recording");
+  setStatus("Aufnahme läuft — nochmal tippen zum Senden", "recording");
 
-  // Safety limit
+  // Safety limit: auto-stop after MAX_RECORD_SECONDS
   recordingTimeout = setTimeout(() => stopRecording(), CONFIG.MAX_RECORD_SECONDS * 1000);
 }
 
@@ -91,20 +92,34 @@ function stopRecording() {
   setStatus("Verarbeite...", "thinking");
 }
 
+// ─── Tap-to-Toggle handler ────────────────────────────────────────────────────
+function onTap(e) {
+  e.preventDefault();
+
+  if (isBusy && !isRecording) return; // pipeline running, ignore
+
+  if (isRecording) {
+    stopRecording();   // second tap → stop + send
+  } else {
+    startRecording();  // first tap → start
+  }
+}
+
 // ─── Main pipeline ────────────────────────────────────────────────────────────
 async function handleRecording(audioBlob) {
   try {
     // 1. STT via Whisper
+    setStatus("Transkribiere...", "thinking");
     const userText = await transcribeAudio(audioBlob);
     if (!userText || !userText.trim()) {
-      setStatus("Bereit", "idle");
+      setStatus("Nichts gehört — nochmal tippen", "idle");
       isBusy = false;
       return;
     }
 
     addBubble("user", userText);
 
-    // 2. Send to OpenClaw
+    // 2. Send to OpenClaw via server proxy
     setStatus("Aven denkt...", "thinking");
     const avenText = await sendToOpenClaw(userText);
     if (!avenText) throw new Error("Leere Antwort von OpenClaw");
@@ -115,25 +130,24 @@ async function handleRecording(audioBlob) {
     setStatus("Aven spricht...", "speaking");
     await speakText(avenText);
 
-    // 4. Parallel: log to Discord
+    // 4. Fire-and-forget: log to Discord
     logToDiscord(userText, avenText).catch(err =>
       console.warn("Discord log failed:", err)
     );
 
-    setStatus("Bereit", "idle");
+    setStatus("Bereit — tippen zum Sprechen", "idle");
   } catch (err) {
     console.error("Pipeline error:", err);
-    setStatus("Fehler", "error");
-    setTimeout(() => setStatus("Bereit", "idle"), 3000);
+    setStatus(`Fehler: ${err.message}`, "error");
+    setTimeout(() => setStatus("Bereit — tippen zum Sprechen", "idle"), 4000);
   } finally {
     isBusy = false;
   }
 }
 
-// ─── STT: Whisper ─────────────────────────────────────────────────────────────
+// ─── STT: Whisper (direct OpenAI — no CORS issue, no token in custom headers) ─
 async function transcribeAudio(blob) {
   const formData = new FormData();
-  // Whisper prefers .webm or .mp4 — use the actual mime to set extension
   const ext = blob.type.includes("ogg") ? "ogg"
     : blob.type.includes("mp4") ? "mp4"
     : "webm";
@@ -142,9 +156,9 @@ async function transcribeAudio(blob) {
   formData.append("language", "de");
 
   const res = await fetch("https://api.openai.com/v1/audio/transcriptions", {
-    method: "POST",
+    method:  "POST",
     headers: { Authorization: `Bearer ${CONFIG.OPENAI_API_KEY}` },
-    body: formData,
+    body:    formData,
   });
 
   if (!res.ok) throw new Error(`Whisper error: ${res.status}`);
@@ -152,54 +166,41 @@ async function transcribeAudio(blob) {
   return data.text?.trim() || "";
 }
 
-// ─── LLM: OpenClaw API ────────────────────────────────────────────────────────
+// ─── LLM: OpenClaw via local proxy (server.js /api/chat) ─────────────────────
+// Proxying avoids CORS and keeps the Gateway token server-side.
 async function sendToOpenClaw(message) {
-  // OpenAI-compatible Chat Completions endpoint exposed by OpenClaw Gateway
-  // model: "openclaw/main" → routes to Aven's main session
-  // x-openclaw-session-key: persists the conversation in Aven's main session
-  const url = `${CONFIG.OPENCLAW_URL}/v1/chat/completions`;
-
-  const res = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Authorization": `Bearer ${CONFIG.OPENCLAW_TOKEN}`,
-      "x-openclaw-session-key": CONFIG.OPENCLAW_SESSION,
-    },
-    body: JSON.stringify({
-      model: `openclaw/${CONFIG.OPENCLAW_SESSION}`,
-      messages: [{ role: "user", content: message }],
-    }),
+  const res = await fetch("/api/chat", {
+    method:  "POST",
+    headers: { "Content-Type": "application/json" },
+    body:    JSON.stringify({ message }),
   });
 
   if (!res.ok) {
     const body = await res.text();
-    throw new Error(`OpenClaw error ${res.status}: ${body}`);
+    throw new Error(`OpenClaw proxy error ${res.status}: ${body}`);
   }
 
   const data = await res.json();
-  // OpenAI-compatible response shape
-  return data.choices?.[0]?.message?.content?.trim() || JSON.stringify(data);
+  return data.reply || "";
 }
 
-// ─── TTS: OpenAI ──────────────────────────────────────────────────────────────
+// ─── TTS: OpenAI (direct — CORS fine for openai.com) ─────────────────────────
 async function speakText(text) {
-  // Interrupt previous audio if still playing
   if (currentAudio) {
     currentAudio.pause();
     currentAudio = null;
   }
 
   const res = await fetch("https://api.openai.com/v1/audio/speech", {
-    method: "POST",
+    method:  "POST",
     headers: {
       "Content-Type": "application/json",
-      Authorization: `Bearer ${CONFIG.OPENAI_API_KEY}`,
+      Authorization:  `Bearer ${CONFIG.OPENAI_API_KEY}`,
     },
     body: JSON.stringify({
-      model: CONFIG.TTS_MODEL,
-      input: text,
-      voice: CONFIG.TTS_VOICE,
+      model:           CONFIG.TTS_MODEL,
+      input:           text,
+      voice:           CONFIG.TTS_VOICE,
       response_format: "mp3",
     }),
   });
@@ -207,32 +208,26 @@ async function speakText(text) {
   if (!res.ok) throw new Error(`TTS error: ${res.status}`);
 
   const arrayBuffer = await res.arrayBuffer();
-  const blob = new Blob([arrayBuffer], { type: "audio/mpeg" });
+  const blob     = new Blob([arrayBuffer], { type: "audio/mpeg" });
   const audioUrl = URL.createObjectURL(blob);
 
   return new Promise((resolve, reject) => {
     const audio = new Audio(audioUrl);
     currentAudio = audio;
-    audio.onended = () => {
-      URL.revokeObjectURL(audioUrl);
-      currentAudio = null;
-      resolve();
-    };
+    audio.onended = () => { URL.revokeObjectURL(audioUrl); currentAudio = null; resolve(); };
     audio.onerror = reject;
     audio.play().catch(reject);
   });
 }
 
-// ─── Discord logging ──────────────────────────────────────────────────────────
+// ─── Discord logging via server proxy ────────────────────────────────────────
 async function logToDiscord(userText, avenText) {
   if (!CONFIG.DISCORD_LOG_CHANNEL) return;
 
-  // Route through local server proxy (/api/log-discord) to avoid CORS
-  // and keep the OpenClaw gateway token server-side
   await fetch("/api/log-discord", {
-    method: "POST",
+    method:  "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
+    body:    JSON.stringify({
       channel: CONFIG.DISCORD_LOG_CHANNEL,
       userText,
       avenText,
@@ -240,39 +235,45 @@ async function logToDiscord(userText, avenText) {
   });
 }
 
-// ─── Button events (touch + mouse) ────────────────────────────────────────────
-function onPressStart(e) {
-  e.preventDefault();
-  if (!isBusy) startRecording();
-}
+// ─── Button events: Tap-to-Toggle ─────────────────────────────────────────────
+// Single unified tap handler — works on iOS touch + desktop click.
+// We use "click" for mouse and "touchend" for touch.
+// touchend prevents the ghost-click 300ms delay on iOS.
 
-function onPressEnd(e) {
-  e.preventDefault();
-  if (isRecording) stopRecording();
-}
+let lastTouchEnd = 0;
 
-micBtn.addEventListener("mousedown", onPressStart);
-micBtn.addEventListener("mouseup", onPressEnd);
-micBtn.addEventListener("mouseleave", onPressEnd);
-micBtn.addEventListener("touchstart", onPressStart, { passive: false });
-micBtn.addEventListener("touchend", onPressEnd, { passive: false });
-micBtn.addEventListener("touchcancel", onPressEnd, { passive: false });
+micBtn.addEventListener("touchend", e => {
+  e.preventDefault();
+  lastTouchEnd = Date.now();
+  onTap(e);
+}, { passive: false });
+
+micBtn.addEventListener("click", e => {
+  // Skip if fired within 500ms of a touchend (ghost click)
+  if (Date.now() - lastTouchEnd < 500) return;
+  onTap(e);
+});
 
 // ─── Init ─────────────────────────────────────────────────────────────────────
 (function init() {
   if (!navigator.mediaDevices?.getUserMedia) {
     setStatus("Browser nicht unterstützt", "error");
     micBtn.disabled = true;
+    return;
   }
 
-  // Request mic permission early on iOS
+  setStatus("Bereit — tippen zum Sprechen", "idle");
+
+  // iOS: request mic permission on first tap (must be in user gesture context)
+  // The actual getUserMedia() call in startRecording() handles this,
+  // but we warm it up here to avoid first-tap delay.
   if (/iPhone|iPad|iPod/.test(navigator.userAgent)) {
-    document.addEventListener("click", async function requestMic() {
+    document.addEventListener("click", async function warmMic() {
       try {
         const s = await navigator.mediaDevices.getUserMedia({ audio: true });
         s.getTracks().forEach(t => t.stop());
       } catch {}
-      document.removeEventListener("click", requestMic);
+      document.removeEventListener("click", warmMic);
     }, { once: true });
   }
 })();

@@ -1,67 +1,64 @@
-// Simple static server for local development / Mac Mini hosting
-// Usage: node server.js
-// Or with env: PORT=8080 node server.js
+// Aven Voice — static + API proxy server
+// Usage: node server.js  |  PORT=8081 node server.js
+//
+// All OpenClaw gateway calls are proxied server-side to avoid CORS
+// and keep credentials out of the browser.
 
-const http = require("http");
+const http  = require("http");
 const https = require("https");
-const fs = require("fs");
-const path = require("path");
-const PORT = process.env.PORT || 8080;
+const fs    = require("fs");
+const path  = require("path");
+const PORT  = process.env.PORT || 8081;
 
 // ─── Load local config for server-side credentials ───────────────────────────
 let LOCAL_CONFIG = {};
 try {
-  // config.local.js uses: const LOCAL_CONFIG = { ... };
-  // Patch const → var so Function() can capture it across block scope
-  const raw = fs.readFileSync(path.join(__dirname, "config.local.js"), "utf8");
+  // config.local.js: const LOCAL_CONFIG = { ... };
+  // Patch const→var so Function() can return it
+  const raw     = fs.readFileSync(path.join(__dirname, "config.local.js"), "utf8");
   const patched = raw.replace("const LOCAL_CONFIG", "var ___cfg");
   // eslint-disable-next-line no-new-func
   LOCAL_CONFIG = new Function(patched + "; return ___cfg;")();
+  console.log("[server] config.local.js loaded, token:", LOCAL_CONFIG.OPENCLAW_TOKEN ? "present" : "MISSING");
 } catch (e) {
   console.warn("[server] Could not load config.local.js:", e.message);
 }
 
-const OPENCLAW_URL    = LOCAL_CONFIG.OPENCLAW_URL    || process.env.OPENCLAW_URL    || "http://localhost:18789";
+// Always talk to Gateway on loopback — Tailscale TLS is only for browser→server
+const GATEWAY_URL     = "http://localhost:18789";
 const OPENCLAW_TOKEN  = LOCAL_CONFIG.OPENCLAW_TOKEN  || process.env.OPENCLAW_TOKEN  || "";
 const OPENCLAW_SESSION = LOCAL_CONFIG.OPENCLAW_SESSION || "main";
 
-// ─── Helper: parse JSON body ──────────────────────────────────────────────────
+// ─── Helper: read JSON request body ──────────────────────────────────────────
 function readBody(req) {
   return new Promise((resolve, reject) => {
-    let body = "";
-    req.on("data", chunk => { body += chunk; });
-    req.on("end", () => {
-      try { resolve(JSON.parse(body || "{}")); }
-      catch (e) { reject(e); }
-    });
+    let buf = "";
+    req.on("data", c => { buf += c; });
+    req.on("end",  () => { try { resolve(JSON.parse(buf || "{}")); } catch (e) { reject(e); } });
     req.on("error", reject);
   });
 }
 
-// ─── Helper: HTTPS/HTTP POST to OpenClaw Gateway ─────────────────────────────
-function gatewayPost(urlStr, payload) {
+// ─── Helper: POST to OpenClaw Gateway (server → loopback, no CORS) ───────────
+function gatewayPost(endpointPath, payload, extraHeaders = {}) {
   return new Promise((resolve, reject) => {
     const body = JSON.stringify(payload);
-    const url = new URL(urlStr);
-    const lib = url.protocol === "https:" ? https : http;
     const options = {
-      hostname: url.hostname,
-      port: url.port || (url.protocol === "https:" ? 443 : 80),
-      path: url.pathname + url.search,
-      method: "POST",
+      hostname: "127.0.0.1",
+      port:     18789,
+      path:     endpointPath,
+      method:   "POST",
       headers: {
-        "Content-Type": "application/json",
+        "Content-Type":   "application/json",
         "Content-Length": Buffer.byteLength(body),
-        "Authorization": `Bearer ${OPENCLAW_TOKEN}`,
-        "x-openclaw-session-key": "agent:main:discord:channel:1508947511099003051",
+        "Authorization":  `Bearer ${OPENCLAW_TOKEN}`,
+        ...extraHeaders,
       },
-      // Allow self-signed cert on Tailscale internal hosts
-      rejectUnauthorized: false,
     };
-    const req = lib.request(options, res => {
+    const req = http.request(options, res => {
       let data = "";
       res.on("data", d => { data += d; });
-      res.on("end", () => resolve({ status: res.statusCode, body: data }));
+      res.on("end",  () => resolve({ status: res.statusCode, body: data }));
     });
     req.on("error", reject);
     req.write(body);
@@ -69,6 +66,7 @@ function gatewayPost(urlStr, payload) {
   });
 }
 
+// ─── Static file MIME ────────────────────────────────────────────────────────
 const MIME = {
   ".html": "text/html; charset=utf-8",
   ".js":   "application/javascript",
@@ -78,61 +76,91 @@ const MIME = {
   ".ico":  "image/x-icon",
 };
 
+// ─── Server ───────────────────────────────────────────────────────────────────
 const server = http.createServer(async (req, res) => {
-  // ─── API: Discord logging proxy ─────────────────────────────────────────
-  if (req.method === "POST" && req.url === "/api/log-discord") {
+
+  // ── POST /api/chat → proxy to OpenClaw /v1/chat/completions ──────────────
+  if (req.method === "POST" && req.url === "/api/chat") {
     try {
-      const { channel, userText, avenText } = await readBody(req);
-      if (!channel || !userText || !avenText) {
-        res.writeHead(400); res.end(JSON.stringify({ error: "Missing fields" }));
+      const { message } = await readBody(req);
+      if (!message) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Missing message" }));
         return;
       }
 
-      // Use chat completions to send a message TO the Discord channel session
-      // by targeting the Aven voice channel session with a log message
-      const text = `🎤 **Du:** ${userText}\n⚡ **Aven:** ${avenText}`;
-
-      // Gateway localhost is always HTTP (Tailscale proxy terminates TLS externally)
-      const gatewayLocal = "http://localhost:18789";
-      const result = await gatewayPost(`${gatewayLocal}/v1/chat/completions`, {
-        model: "openclaw/main",
-        messages: [{ role: "user", content: `[Voice Log — sende diese Nachricht als kurze Zusammenfassung im Discord-Channel #aven-voice: ${text}]` }],
+      const result = await gatewayPost("/v1/chat/completions", {
+        model:    `openclaw/${OPENCLAW_SESSION}`,
+        messages: [{ role: "user", content: message }],
+      }, {
+        "x-openclaw-session-key": OPENCLAW_SESSION,
       });
 
-      console.log(`[discord-log] Gateway response ${result.status}`);
+      if (result.status !== 200) {
+        console.error(`[chat] Gateway error ${result.status}:`, result.body.substring(0, 200));
+        res.writeHead(502, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: `Gateway returned ${result.status}`, detail: result.body }));
+        return;
+      }
+
+      const data  = JSON.parse(result.body);
+      const reply = data.choices?.[0]?.message?.content?.trim() || "";
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ ok: true, gatewayStatus: result.status }));
+      res.end(JSON.stringify({ reply }));
     } catch (err) {
-      console.error("[discord-log] Error:", err.message);
-      res.writeHead(500); res.end(JSON.stringify({ error: err.message }));
+      console.error("[chat] Error:", err.message);
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: err.message }));
     }
     return;
   }
 
-  // ─── Static file serving ─────────────────────────────────────────────────
+  // ── POST /api/log-discord → forward voice log to Discord via Gateway ──────
+  if (req.method === "POST" && req.url === "/api/log-discord") {
+    try {
+      const { channel, userText, avenText } = await readBody(req);
+      if (!userText || !avenText) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Missing fields" }));
+        return;
+      }
+
+      // Target the #aven-voice Discord channel session directly
+      const logMsg = `🎤 **Du:** ${userText}\n⚡ **Aven:** ${avenText}`;
+      const result = await gatewayPost("/v1/chat/completions", {
+        model:    "openclaw/main",
+        messages: [{ role: "user", content: logMsg }],
+      }, {
+        // Route to the voice channel session so it appears in Discord
+        "x-openclaw-session-key": `agent:main:discord:channel:${channel || "1508947511099003051"}`,
+      });
+
+      console.log(`[discord-log] Gateway ${result.status}`);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true, status: result.status }));
+    } catch (err) {
+      console.error("[discord-log] Error:", err.message);
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: err.message }));
+    }
+    return;
+  }
+
+  // ── Static files ──────────────────────────────────────────────────────────
   let filePath = path.join(__dirname, req.url === "/" ? "index.html" : req.url);
 
-  // Serve config.local.js if it exists, otherwise config.js
+  // config.local.js → serve only if it exists (gitignored)
   if (req.url === "/config.local.js") {
     const local = path.join(__dirname, "config.local.js");
-    if (!fs.existsSync(local)) {
-      res.writeHead(404);
-      res.end("Not found");
-      return;
-    }
+    if (!fs.existsSync(local)) { res.writeHead(404); res.end("Not found"); return; }
     filePath = local;
   }
 
   fs.readFile(filePath, (err, data) => {
-    if (err) {
-      res.writeHead(404);
-      res.end("Not found");
-      return;
-    }
+    if (err) { res.writeHead(404); res.end("Not found"); return; }
     const ext = path.extname(filePath);
     res.writeHead(200, {
-      "Content-Type": MIME[ext] || "application/octet-stream",
-      // HTTPS required for mic on iOS — use Tailscale + a reverse proxy or ngrok for dev
+      "Content-Type":  MIME[ext] || "application/octet-stream",
       "Cache-Control": "no-cache",
     });
     res.end(data);
