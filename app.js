@@ -154,16 +154,22 @@ async function transcribeAudio(blob) {
 
 // ─── LLM: OpenClaw API ────────────────────────────────────────────────────────
 async function sendToOpenClaw(message) {
-  // OpenClaw message send API
-  const url = `${CONFIG.OPENCLAW_URL}/api/sessions/${CONFIG.OPENCLAW_SESSION}/message`;
+  // OpenAI-compatible Chat Completions endpoint exposed by OpenClaw Gateway
+  // model: "openclaw/main" → routes to Aven's main session
+  // x-openclaw-session-key: persists the conversation in Aven's main session
+  const url = `${CONFIG.OPENCLAW_URL}/v1/chat/completions`;
 
   const res = await fetch(url, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      Authorization: `Bearer ${CONFIG.OPENCLAW_TOKEN}`,
+      "Authorization": `Bearer ${CONFIG.OPENCLAW_TOKEN}`,
+      "x-openclaw-session-key": CONFIG.OPENCLAW_SESSION,
     },
-    body: JSON.stringify({ message }),
+    body: JSON.stringify({
+      model: `openclaw/${CONFIG.OPENCLAW_SESSION}`,
+      messages: [{ role: "user", content: message }],
+    }),
   });
 
   if (!res.ok) {
@@ -172,8 +178,8 @@ async function sendToOpenClaw(message) {
   }
 
   const data = await res.json();
-  // Response shape: { reply: "...", ... } or { message: "..." }
-  return data.reply || data.message || data.text || JSON.stringify(data);
+  // OpenAI-compatible response shape
+  return data.choices?.[0]?.message?.content?.trim() || JSON.stringify(data);
 }
 
 // ─── TTS: OpenAI ──────────────────────────────────────────────────────────────
@@ -221,17 +227,15 @@ async function speakText(text) {
 async function logToDiscord(userText, avenText) {
   if (!CONFIG.DISCORD_LOG_CHANNEL) return;
 
-  // Route through OpenClaw's internal message API to avoid CORS
-  const url = `${CONFIG.OPENCLAW_URL}/api/message/send`;
-  await fetch(url, {
+  // Route through local server proxy (/api/log-discord) to avoid CORS
+  // and keep the OpenClaw gateway token server-side
+  await fetch("/api/log-discord", {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${CONFIG.OPENCLAW_TOKEN}`,
-    },
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      channel: `channel:${CONFIG.DISCORD_LOG_CHANNEL}`,
-      text: `🎙️ **Du:** ${userText}\n⚡ **Aven:** ${avenText}`,
+      channel: CONFIG.DISCORD_LOG_CHANNEL,
+      userText,
+      avenText,
     }),
   });
 }
