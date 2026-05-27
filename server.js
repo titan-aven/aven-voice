@@ -25,9 +25,22 @@ try {
 }
 
 // Always talk to Gateway on loopback — Tailscale TLS is only for browser→server
-const GATEWAY_URL     = "http://localhost:18789";
-const OPENCLAW_TOKEN  = LOCAL_CONFIG.OPENCLAW_TOKEN  || process.env.OPENCLAW_TOKEN  || "";
+const GATEWAY_URL      = "http://localhost:18789";
+const OPENCLAW_TOKEN   = LOCAL_CONFIG.OPENCLAW_TOKEN   || process.env.OPENCLAW_TOKEN   || "";
 const OPENCLAW_SESSION = LOCAL_CONFIG.OPENCLAW_SESSION || "main";
+const OPENAI_API_KEY   = LOCAL_CONFIG.OPENAI_API_KEY   || process.env.OPENAI_API_KEY   || "";
+
+console.log("[server] OpenAI key:", OPENAI_API_KEY ? "present" : "MISSING");
+
+// ─── Helper: read raw binary body (for multipart forwarding) ───────────────
+function readRawBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    req.on("data", c => chunks.push(c));
+    req.on("end",  () => resolve(Buffer.concat(chunks)));
+    req.on("error", reject);
+  });
+}
 
 // ─── Helper: read JSON request body ──────────────────────────────────────────
 function readBody(req) {
@@ -78,6 +91,65 @@ const MIME = {
 
 // ─── Server ───────────────────────────────────────────────────────────────────
 const server = http.createServer(async (req, res) => {
+
+  // ── POST /api/transcribe → proxy multipart audio to OpenAI Whisper ────────
+  if (req.method === "POST" && req.url === "/api/transcribe") {
+    try {
+      const contentType = req.headers["content-type"] || "";
+      if (!contentType.includes("multipart/form-data")) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Expected multipart/form-data" }));
+        return;
+      }
+
+      // Read the raw multipart body from browser
+      const rawBody = await readRawBody(req);
+      console.log(`[transcribe] Received audio ${rawBody.length} bytes, content-type: ${contentType}`);
+
+      // Forward to OpenAI Whisper as-is (same boundary, same body)
+      const openaiRes = await new Promise((resolve, reject) => {
+        const options = {
+          hostname: "api.openai.com",
+          port:     443,
+          path:     "/v1/audio/transcriptions",
+          method:   "POST",
+          headers: {
+            "Authorization":  `Bearer ${OPENAI_API_KEY}`,
+            "Content-Type":   contentType,
+            "Content-Length": rawBody.length,
+          },
+        };
+        const req2 = https.request(options, res2 => {
+          const chunks = [];
+          res2.on("data", d => chunks.push(d));
+          res2.on("end",  () => resolve({ status: res2.statusCode, body: Buffer.concat(chunks).toString() }));
+        });
+        req2.on("error", reject);
+        req2.write(rawBody);
+        req2.end();
+      });
+
+      console.log(`[transcribe] OpenAI response ${openaiRes.status}: ${openaiRes.body.substring(0, 200)}`);
+
+      if (openaiRes.status !== 200) {
+        console.error(`[transcribe] OpenAI error ${openaiRes.status}:`, openaiRes.body);
+        res.writeHead(502, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: `OpenAI returned ${openaiRes.status}`, detail: openaiRes.body }));
+        return;
+      }
+
+      const data = JSON.parse(openaiRes.body);
+      const text = data.text?.trim() || "";
+      console.log(`[transcribe] Transcribed: "${text.substring(0, 80)}…"`);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ text }));
+    } catch (err) {
+      console.error("[transcribe] Error:", err.message);
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: err.message }));
+    }
+    return;
+  }
 
   // ── POST /api/chat → proxy to OpenClaw /v1/chat/completions ──────────────
   if (req.method === "POST" && req.url === "/api/chat") {

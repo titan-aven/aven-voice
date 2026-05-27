@@ -145,23 +145,30 @@ async function handleRecording(audioBlob) {
   }
 }
 
-// ─── STT: Whisper (direct OpenAI — no CORS issue, no token in custom headers) ─
+// ─── STT: Whisper via server proxy (/api/transcribe) ───────────────────────────
+// Proxying avoids any CORS / network issues from browser → OpenAI directly,
+// and keeps the OpenAI key server-side. Server logs full error details.
 async function transcribeAudio(blob) {
   const formData = new FormData();
+  // Whisper supports webm, mp4, ogg, m4a etc.
   const ext = blob.type.includes("ogg") ? "ogg"
     : blob.type.includes("mp4") ? "mp4"
+    : blob.type.includes("m4a") ? "m4a"
     : "webm";
-  formData.append("file", blob, `audio.${ext}`);
-  formData.append("model", "whisper-1");
+  formData.append("file",     blob, `audio.${ext}`);
+  formData.append("model",    "whisper-1");
   formData.append("language", "de");
 
-  const res = await fetch("https://api.openai.com/v1/audio/transcriptions", {
-    method:  "POST",
-    headers: { Authorization: `Bearer ${CONFIG.OPENAI_API_KEY}` },
-    body:    formData,
+  const res = await fetch("/api/transcribe", {
+    method: "POST",
+    body:   formData,
+    // No Content-Type header — browser sets multipart boundary automatically
   });
 
-  if (!res.ok) throw new Error(`Whisper error: ${res.status}`);
+  if (!res.ok) {
+    const detail = await res.text();
+    throw new Error(`Whisper proxy error ${res.status}: ${detail}`);
+  }
   const data = await res.json();
   return data.text?.trim() || "";
 }
