@@ -1,0 +1,29 @@
+name: CI (build check)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Node.js syntax/build check
+        run: |
+          set -e
+          shopt -s globstar
+          fail=0
+          for f in **/*.js; do
+            [ -f "$f" ] || continue
+            node --check "$f" || fail=1
+          done
+          exit $fail
+      # NOTE: no package.json / test suite exists yet in this repo.
+      # Lint (eslint) and automated tests should be added as a follow-up;
+      # this job only guarantees every .js file is at least syntactically valid.
